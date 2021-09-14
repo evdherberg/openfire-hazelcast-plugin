@@ -24,11 +24,14 @@ import com.hazelcast.core.Member;
 import com.hazelcast.core.MemberAttributeEvent;
 import com.hazelcast.core.MembershipEvent;
 import com.hazelcast.core.MembershipListener;
+import org.jivesoftware.openfire.SessionManager;
 import org.jivesoftware.openfire.XMPPServer;
 import org.jivesoftware.openfire.cluster.ClusterManager;
 import org.jivesoftware.openfire.cluster.ClusterNodeInfo;
 import org.jivesoftware.openfire.cluster.NodeID;
 import org.jivesoftware.openfire.plugin.util.cluster.HazelcastClusterNodeInfo;
+import org.jivesoftware.openfire.session.ClientSessionInfo;
+import org.jivesoftware.openfire.session.RemoteSessionLocator;
 import org.jivesoftware.util.cache.Cache;
 import org.jivesoftware.util.cache.CacheWrapper;
 import org.slf4j.Logger;
@@ -89,7 +92,6 @@ public class ClusterListener implements MembershipListener, LifecycleListener {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private boolean isDone() {
         return done;
     }

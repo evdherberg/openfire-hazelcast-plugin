@@ -320,7 +320,7 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             } catch (final InterruptedException e) {
                 logger.error("Failed to get cluster lock", e);
                 result = false;
-                registerLockAcquired(key, result);
+                registerLockAcquired(key, false);
             }
         }
         return result;
@@ -401,29 +401,24 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
         } else {
             // Find the lock info object, hopefully at the beginning of the list
-            LockInfo mostRecentLockInfo = lockInfoListForThisKey.getFirst();
-            if (mostRecentLockInfo.isWaiting() && mostRecentLockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                // Found it at the expected place
-                mostRecentLockInfo.registerAcquired();
-            } else {
-                // Didn't find it at the expected place. Maybe deeper down the list.
-                final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
-                LockInfo matchingLockInfo = null;
-                for (LockInfo lockInfo : lockInfoListForThisKey) {
-                    if (lockInfo.isWaiting() && mostRecentLockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                        // Found it!
-                        matchingLockInfo = lockInfo;
-                        break;
-                    } else {
-                        moreRecentlyRegisteredLocks.add(lockInfo);
-                    }
-                }
-                if (matchingLockInfo == null) {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
+            final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
+            LockInfo matchingLockInfo = null;
+            for (LockInfo lockInfo : lockInfoListForThisKey) {
+                if (lockInfo.isWaiting() && lockInfo.getThreadName().equals(Thread.currentThread().getName())) {
+                    // Found it!
+                    matchingLockInfo = lockInfo;
+                    break;
                 } else {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but this is not the most recent thread to have requested a lock. This may still be a valid situation because threads sometimes need to queue in waiting for a lock. Other locks registered more recently: {}.", key, Thread.currentThread().getName(), moreRecentlyRegisteredLocks);
-                    matchingLockInfo.registerAcquired();
+                    moreRecentlyRegisteredLocks.add(lockInfo);
                 }
+            }
+            if (matchingLockInfo == null) {
+                logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
+            } else {
+                if (!moreRecentlyRegisteredLocks.isEmpty()) {
+                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but this is not the most recent thread to have requested a lock. This may still be a valid situation because threads sometimes need to queue in waiting for a lock. Other locks registered more recently: {}.", key, Thread.currentThread().getName(), moreRecentlyRegisteredLocks);
+                }
+                matchingLockInfo.registerAcquired();
             }
         }
     }
@@ -440,40 +435,29 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
         } else {
             // Find the lock info object, hopefully at the beginning of the list
-            LockInfo mostRecentLockInfo = lockInfoListForThisKey.getFirst();
-            if (mostRecentLockInfo.isActive() && mostRecentLockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                // Found it at the expected place
-                final LockInfo currentLockHolder = findCurrentLockHolder(key).orElse(null);
-                if (mostRecentLockInfo.equals(currentLockHolder)) {
-                    mostRecentLockInfo.registerReleased();
-                    moveToArchive(mostRecentLockInfo);
+            final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
+            LockInfo matchingLockInfo = null;
+            for (LockInfo lockInfo : lockInfoListForThisKey) {
+                if (lockInfo.isActive() && lockInfo.getThreadName().equals(Thread.currentThread().getName())) {
+                    // Found it!
+                    matchingLockInfo = lockInfo;
+                    break;
                 } else {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired lock {}, but currently lock {} is the active one.", Thread.currentThread().getName(), mostRecentLockInfo, currentLockHolder);
+                    moreRecentlyRegisteredLocks.add(lockInfo);
                 }
+            }
+            if (matchingLockInfo == null) {
+                logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
             } else {
-                // Didn't find it at the expected place. Maybe deeper down the list.
-                final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
-                LockInfo matchingLockInfo = null;
-                for (LockInfo lockInfo : lockInfoListForThisKey) {
-                    if (lockInfo.isActive() && mostRecentLockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                        // Found it!
-                        matchingLockInfo = lockInfo;
-                        break;
-                    } else {
-                        moreRecentlyRegisteredLocks.add(lockInfo);
-                    }
-                }
-                if (matchingLockInfo == null) {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
-                } else {
+                if (!moreRecentlyRegisteredLocks.isEmpty()) {
                     logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but this is not the most recent thread to have requested a lock. This may still be a valid situation because threads sometimes need to queue in waiting for a lock. Other locks registered more recently: {}.", key, Thread.currentThread().getName(), moreRecentlyRegisteredLocks);
-                    final LockInfo currentLockHolder = findCurrentLockHolder(key).orElse(null);
-                    if (matchingLockInfo.equals(currentLockHolder)) {
-                        matchingLockInfo.registerReleased();
-                        moveToArchive(matchingLockInfo);
-                    } else {
-                        logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired lock {}, but currently lock {} is the active one.", Thread.currentThread().getName(), matchingLockInfo, currentLockHolder);
-                    }
+                }
+                final LockInfo currentLockHolder = findCurrentLockHolder(key).orElse(null);
+                if (matchingLockInfo.equals(currentLockHolder)) {
+                    matchingLockInfo.registerReleased();
+                    moveToArchive(matchingLockInfo);
+                } else {
+                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired lock {}, but currently lock {} is the active one.", Thread.currentThread().getName(), matchingLockInfo, currentLockHolder);
                 }
             }
         }

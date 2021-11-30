@@ -524,6 +524,30 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             .collect(Collectors.toList());
     }
 
+    /**
+     * Returns names of all threads that are currently holding a lock on an entry in this cache, or waiting for one.
+     * This can be used to build a 'global' set of all threads that are currently locking things.
+     * @return
+     */
+    public Set<String> getAllThreadNamesHoldingOrWaitingForLocks() {
+        return lockRegistration.values().stream()
+            .flatMap(LinkedList::stream)
+            .map(LockInfo::getThreadName)
+            .collect(Collectors.toSet());
+    }
+
+    /**
+     * Returns information about all locks in this cache that are currently held or waited for by the referenced thread.
+     * @param threadName
+     * @return
+     */
+    public Set<LockInfo> getAllLocksHeldByOrWaitingForByThread(final String threadName) {
+        return lockRegistration.values().stream()
+            .flatMap(LinkedList::stream)
+            .filter(lockInfo -> lockInfo.getThreadName().equals(threadName))
+            .collect(Collectors.toSet());
+    }
+
     class LockInfo implements Serializable {
         private K key;
         private String threadName;

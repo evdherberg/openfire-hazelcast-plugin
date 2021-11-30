@@ -63,6 +63,7 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
     // Maps for tracking information about locks
     // Not using ConcurrentHashMap on purpose - we do want to see errors occur if there are concurrent modifications - that may tell us something
     private static final int REGISTRATION_MAX_SIZE_PER_KEY = 20;
+    private static final long HANGING_LOCK_DETECTION_THRESHOLD_SECONDS = 30L;
     private final Map<K, LinkedList<LockInfo>> lockRegistration = new HashMap<>();
     private final Map<K, LinkedList<LockInfo>> lockRegistrationArchive = new HashMap<>();
 
@@ -498,6 +499,29 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             logger.error("LOCK TRACKING - There is more than one active lock holder for key {}: {}", key, activeLocksForKey);
             return Optional.empty();
         }
+    }
+
+    /**
+     * Returns information about all locks that have been active (acquired) for more than 30 seconds.
+     * @return
+     */
+    public List<LockInfo> getPotentiallyHangingLocks() {
+        LocalDateTime lockAcquiredThreshold = LocalDateTime.now().minusSeconds(HANGING_LOCK_DETECTION_THRESHOLD_SECONDS);
+        return lockRegistration.values().stream()
+            .flatMap(LinkedList::stream)
+            .filter(LockInfo::isActive)
+            .filter(lockInfo -> lockInfo.getLockAcquiredTime().equals(lockAcquiredThreshold))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Returns information about all locks that appear to be waiting, while the referenced cache entry is currently not locked at all.
+     * @return
+     */
+    public List<LinkedList<LockInfo>> getPotentiallyInconsistentLockEntries() {
+        return lockRegistration.values().stream()
+            .filter(lockInfos -> lockInfos.stream().noneMatch(LockInfo::isActive))
+            .collect(Collectors.toList());
     }
 
     class LockInfo implements Serializable {

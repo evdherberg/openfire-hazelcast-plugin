@@ -510,7 +510,7 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
         return lockRegistration.values().stream()
             .flatMap(LinkedList::stream)
             .filter(LockInfo::isActive)
-            .filter(lockInfo -> lockInfo.getLockAcquiredTime().equals(lockAcquiredThreshold))
+            .filter(lockInfo -> lockInfo.getLockAcquiredTime().isBefore(lockAcquiredThreshold))
             .collect(Collectors.toList());
     }
 

@@ -35,20 +35,11 @@ import javax.annotation.Nonnull;
 import java.io.Serializable;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
  * Clustered implementation of the Cache interface using Hazelcast.
@@ -59,13 +50,6 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
     private final Logger logger;
 
     private final Set<String> listeners = ConcurrentHashMap.newKeySet();
-
-    // Maps for tracking information about locks
-    // Not using ConcurrentHashMap on purpose - we do want to see errors occur if there are concurrent modifications - that may tell us something
-    private static final int REGISTRATION_MAX_SIZE_PER_KEY = 20;
-    private static final long HANGING_LOCK_DETECTION_THRESHOLD_SECONDS = 30L;
-    private final Map<K, LinkedList<LockInfo>> lockRegistration = new HashMap<>();
-    private final Map<K, LinkedList<LockInfo>> lockRegistrationArchive = new HashMap<>();
 
     /**
      * The map is used for distributed operations such as get, put, etc.
@@ -306,22 +290,15 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
     boolean lock(final K key, final long timeout) {
         boolean result = true;
         if (timeout < 0) {
-            registerLockRequested(key);
             map.lock(key);
-            registerLockAcquired(key, true);
         } else if (timeout == 0) {
-            registerLockRequested(key);
             result = map.tryLock(key);
-            registerLockAcquired(key, result);
         } else {
             try {
-                registerLockRequested(key);
                 result = map.tryLock(key, timeout, TimeUnit.MILLISECONDS);
-                registerLockAcquired(key, result);
             } catch (final InterruptedException e) {
                 logger.error("Failed to get cluster lock", e);
                 result = false;
-                registerLockAcquired(key, false);
             }
         }
         return result;
@@ -330,7 +307,6 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
     void unlock(final K key) {
         try {
             map.unlock(key);
-            registerLockReleased(key);
         } catch (final IllegalMonitorStateException e) {
             logger.error("Failed to release cluster lock", e);
         }
@@ -369,280 +345,4 @@ public class ClusteredCache<K extends Serializable, V extends Serializable> impl
             lastPluginClassLoaderWarning = Instant.now();
         }
     }
-
-    /**
-     * Adds a LockInfo object to the lock registration for the specified key.
-     * @param key The key for which the lock is requested.
-     */
-    private void registerLockRequested(K key) {
-        logger.debug("LOCK TRACKING - Thread {} requested a lock on key {}.", Thread.currentThread().getName(), key);
-        LockInfo lockInfo = new LockInfo(key);
-        final LinkedList<LockInfo> lockInfosForThisKey = this.lockRegistration.computeIfAbsent(key, k -> new LinkedList<>());
-        if (lockInfosForThisKey.size() >= ClusteredCache.REGISTRATION_MAX_SIZE_PER_KEY) {
-            logger.warn("LOCK TRACKING - Not registering lock request by thread {} on key {} because the registration has reached capacity.", Thread.currentThread().getName(), key);
-        } else {
-            lockInfosForThisKey.addFirst(lockInfo);
-        }
-    }
-
-    /**
-     * Updates an existing LockInfo object in the registration to reflect that that lock as actually been applied.
-     * @param key The key for which the lock is acquired.
-     * @param acquireWasSuccessful Whether the lock could actually be acquired.
-     */
-    private void registerLockAcquired(K key, boolean acquireWasSuccessful) {
-        if (!acquireWasSuccessful) {
-            logger.warn("LOCK TRACKING - Thread {} tried to acquire a lock on key {}, but failed to get it.", Thread.currentThread().getName(), key);
-            return;
-        }
-
-        logger.debug("LOCK TRACKING - Thread {} acquired a lock on key {}", Thread.currentThread().getName(), key);
-        LinkedList<LockInfo> lockInfoListForThisKey = this.lockRegistration.get(key);
-        if (lockInfoListForThisKey == null || lockInfoListForThisKey.isEmpty()) {
-            logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
-        } else {
-            // Find the lock info object, hopefully at the beginning of the list
-            final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
-            LockInfo matchingLockInfo = null;
-            for (LockInfo lockInfo : lockInfoListForThisKey) {
-                if (lockInfo.isWaiting() && lockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                    // Found it!
-                    matchingLockInfo = lockInfo;
-                    break;
-                } else {
-                    moreRecentlyRegisteredLocks.add(lockInfo);
-                }
-            }
-            if (matchingLockInfo == null) {
-                logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
-            } else {
-                if (!moreRecentlyRegisteredLocks.isEmpty()) {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but this is not the most recent thread to have requested a lock. This may still be a valid situation because threads sometimes need to queue in waiting for a lock. Other locks registered more recently: {}.", key, Thread.currentThread().getName(), moreRecentlyRegisteredLocks);
-                }
-                matchingLockInfo.registerAcquired();
-            }
-        }
-    }
-
-    /**
-     * Updates an existing LockInfo object in the registration to reflect that that lock as been released.
-     * This also moves the lock info from the lock registration to the archive.
-     * @param key The key for which the lock is releases.
-     */
-    private void registerLockReleased(K key) {
-        logger.debug("LOCK TRACKING - Thread {} released a lock on key {}.", Thread.currentThread().getName(), key);
-        LinkedList<LockInfo> lockInfoListForThisKey = this.lockRegistration.get(key);
-        if (lockInfoListForThisKey == null || lockInfoListForThisKey.isEmpty()) {
-            logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
-        } else {
-            // Find the lock info object, hopefully at the beginning of the list
-            final List<LockInfo> moreRecentlyRegisteredLocks = new ArrayList<>();
-            LockInfo matchingLockInfo = null;
-            for (LockInfo lockInfo : lockInfoListForThisKey) {
-                if (lockInfo.isActive() && lockInfo.getThreadName().equals(Thread.currentThread().getName())) {
-                    // Found it!
-                    matchingLockInfo = lockInfo;
-                    break;
-                } else {
-                    moreRecentlyRegisteredLocks.add(lockInfo);
-                }
-            }
-            if (matchingLockInfo == null) {
-                logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but there is no lock registered for that key.", Thread.currentThread().getName(), key);
-            } else {
-                if (!moreRecentlyRegisteredLocks.isEmpty()) {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired a lock on key {}, but this is not the most recent thread to have requested a lock. This may still be a valid situation because threads sometimes need to queue in waiting for a lock. Other locks registered more recently: {}.", key, Thread.currentThread().getName(), moreRecentlyRegisteredLocks);
-                }
-                final LockInfo currentLockHolder = findCurrentLockHolder(key).orElse(null);
-                if (matchingLockInfo.equals(currentLockHolder)) {
-                    matchingLockInfo.registerReleased();
-                    moveToArchive(matchingLockInfo);
-                } else {
-                    logger.warn("LOCK TRACKING - Thread {} is supposed to have acquired lock {}, but currently lock {} is the active one.", Thread.currentThread().getName(), matchingLockInfo, currentLockHolder);
-                }
-            }
-        }
-    }
-
-    /**
-     * Removes the referenced LockInfo from the registration and adds it to the archive.
-     * If the archive is at full capacity, the oldest entry is removed.
-     * @param lockInfo The lock info to archive.
-     */
-    private void moveToArchive(@Nonnull LockInfo lockInfo) {
-        final LinkedList<LockInfo> lockInfos = lockRegistration.get(lockInfo.getKey());
-        if (lockInfos == null || !lockInfos.remove(lockInfo)) {
-            logger.warn("LOCK TRACKING - Can't move {} to lock registration archive because it was not found in the lock registration.", lockInfo);
-        } else {
-            lockRegistrationArchive.computeIfAbsent(lockInfo.getKey(), k -> new LinkedList<>()).addFirst(lockInfo);
-            if (lockRegistrationArchive.get(lockInfo.getKey()).size() > REGISTRATION_MAX_SIZE_PER_KEY) {
-                lockRegistrationArchive.get(lockInfo.getKey()).removeLast();
-            }
-            logger.debug("LOCK TRACKING - Moved {} to lock registration archive. Current registration size is {} and archive size is {}.", lockInfo, lockInfos.size(), lockRegistrationArchive.get(lockInfo.getKey()).size());
-        }
-    }
-
-    /**
-     * Find the current holder of an active lock on the referenced key.
-     * @param key The key for which to find the active lock holder.
-     * @return The active lock holder, if any.
-     */
-    private Optional<LockInfo> findCurrentLockHolder(K key) {
-        final List<LockInfo> activeLocksForKey = lockRegistration.computeIfAbsent(key, k -> new LinkedList<>()).stream().filter(LockInfo::isActive).collect(Collectors.toList());
-        if (activeLocksForKey.isEmpty()) {
-            logger.debug("LOCK TRACKING - There is no active lock holder for key {}", key);
-            return Optional.empty();
-        } else if (activeLocksForKey.size() == 1) {
-            logger.debug("LOCK TRACKING - There is a single active lock holder for key {}: {}", key, activeLocksForKey.get(0));
-            return Optional.of(activeLocksForKey.get(0));
-        } else {
-            logger.error("LOCK TRACKING - There is more than one active lock holder for key {}: {}", key, activeLocksForKey);
-            return Optional.empty();
-        }
-    }
-
-    /**
-     * Returns information about all locks that have been active (acquired) for more than 30 seconds.
-     * @return
-     */
-    public List<LockInfo> getPotentiallyHangingLocks() {
-        LocalDateTime lockAcquiredThreshold = LocalDateTime.now().minusSeconds(HANGING_LOCK_DETECTION_THRESHOLD_SECONDS);
-        return lockRegistration.values().stream()
-            .flatMap(LinkedList::stream)
-            .filter(LockInfo::isActive)
-            .filter(lockInfo -> lockInfo.getLockAcquiredTime().isBefore(lockAcquiredThreshold))
-            .collect(Collectors.toList());
-    }
-
-    /**
-     * Returns information about all locks that appear to be waiting, while the referenced cache entry is currently not locked at all.
-     * @return
-     */
-    public List<LinkedList<LockInfo>> getPotentiallyInconsistentLockEntries() {
-        return lockRegistration.values().stream()
-            .filter(lockInfos -> lockInfos.stream().noneMatch(LockInfo::isActive))
-            .collect(Collectors.toList());
-    }
-
-    /**
-     * Returns names of all threads that are currently holding a lock on an entry in this cache, or waiting for one.
-     * This can be used to build a 'global' set of all threads that are currently locking things.
-     * @return
-     */
-    public Set<String> getAllThreadNamesHoldingOrWaitingForLocks() {
-        return lockRegistration.values().stream()
-            .flatMap(LinkedList::stream)
-            .map(LockInfo::getThreadName)
-            .collect(Collectors.toSet());
-    }
-
-    /**
-     * Returns information about all locks in this cache that are currently held or waited for by the referenced thread.
-     * @param threadName
-     * @return
-     */
-    public Set<LockInfo> getAllLocksHeldByOrWaitingForByThread(final String threadName) {
-        return lockRegistration.values().stream()
-            .flatMap(LinkedList::stream)
-            .filter(lockInfo -> lockInfo.getThreadName().equals(threadName))
-            .collect(Collectors.toSet());
-    }
-
-    class LockInfo implements Serializable {
-        private K key;
-        private String threadName;
-        private LocalDateTime lockRequestedTime;
-        private LocalDateTime lockAcquiredTime;
-        private LocalDateTime lockReleasedTime;
-        private List<String> lockRequestedTrace;
-        private List<String> lockReleasedTrace;
-
-        public LockInfo(K key) {
-            this.key = key;
-            this.threadName = Thread.currentThread().getName();
-            registerRequested();
-        }
-
-        private void registerRequested() {
-            this.lockRequestedTime = LocalDateTime.now();
-            this.lockRequestedTrace = determineStackTrace();
-        }
-
-        public void registerAcquired() {
-            this.lockAcquiredTime = LocalDateTime.now();
-        }
-
-        public void registerReleased() {
-            this.lockReleasedTime = LocalDateTime.now();
-            this.lockReleasedTrace = determineStackTrace();
-        }
-
-        public boolean isWaiting() {
-            return this.lockRequestedTime != null && this.lockAcquiredTime == null;
-        }
-
-        public boolean isActive() {
-            return this.lockAcquiredTime != null && this.lockReleasedTime == null;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            LockInfo lockInfo = (LockInfo) o;
-            return key.equals(lockInfo.key) && threadName.equals(lockInfo.threadName) && lockRequestedTime.equals(lockInfo.lockRequestedTime);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(key, threadName, lockRequestedTime);
-        }
-
-        @Override
-        public String toString() {
-            return "LockInfo{" +
-                "key=" + key +
-                ", threadName='" + threadName + '\'' +
-                ", lockRequestedTime=" + lockRequestedTime +
-                '}';
-        }
-
-        private List<String> determineStackTrace() {
-            StackTraceElement[] elements = Thread.currentThread().getStackTrace();
-            return Arrays.stream(elements)
-                .skip(2L) // First two lines of stack trace are uninteresting, because they reflect this place
-                .limit(10L) // Limit number of lines to keep it manageable
-                .map(StackTraceElement::toString)
-                .collect(Collectors.toList());
-        }
-
-        public K getKey() {
-            return key;
-        }
-
-        public String getThreadName() {
-            return threadName;
-        }
-
-        public LocalDateTime getLockRequestedTime() {
-            return lockRequestedTime;
-        }
-
-        public LocalDateTime getLockAcquiredTime() {
-            return lockAcquiredTime;
-        }
-
-        public LocalDateTime getLockReleasedTime() {
-            return lockReleasedTime;
-        }
-
-        public List<String> getLockRequestedTrace() {
-            return lockRequestedTrace;
-        }
-
-        public List<String> getLockReleasedTrace() {
-            return lockReleasedTrace;
-        }
-    }
-
 }

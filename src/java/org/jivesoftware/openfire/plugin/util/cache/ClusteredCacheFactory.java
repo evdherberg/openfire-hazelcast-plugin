@@ -145,6 +145,11 @@ public class ClusteredCacheFactory implements CacheFactoryStrategy {
      */
     private static Map<String, Map<String, long[]>> cacheStats;
 
+    /**
+     * Tracker for cache locks
+     */
+    private static ClusteredCacheLockTracker cacheLockTracker;
+
     private static HazelcastInstance hazelcast = null;
     private static Cluster cluster = null;
     private ClusterListener clusterListener;
@@ -164,6 +169,12 @@ public class ClusteredCacheFactory implements CacheFactoryStrategy {
     public ClusteredCacheFactory() {
         pluginClassLoaderWarnings = CacheFactory.createLocalCache("PluginClassLoader Warnings for Clustered Tasks");
         pluginClassLoaderWarnings.setMaxLifetime(Duration.ofHours(1).toMillis()); // Minimum duration between logged warnings.
+
+        // TODO Read some configuration to figure out whether we should track locks
+        boolean shouldTrackLocks = true;
+        if (shouldTrackLocks) {
+            cacheLockTracker = new ClusteredCacheLockTracker();
+        }
     }
 
     @Override
@@ -545,8 +556,16 @@ public class ClusteredCacheFactory implements CacheFactoryStrategy {
         if (cache instanceof CacheWrapper) {
             cache = ((CacheWrapper) cache).getWrappedCache();
         }
-        // TODO: Update CacheFactoryStrategy so the signature is getLock(final Serializable key, Cache<Serializable, Serializable> cache)
-        @SuppressWarnings("unchecked") final ClusterLock clusterLock = new ClusterLock((Serializable) key, (ClusteredCache<Serializable, ?>) cache);
+
+        @SuppressWarnings("unchecked") final ClusterLock clusterLock;
+        if (cacheLockTracker != null) {
+            // Use a modified ClusterLock that writes data to the tracker
+            clusterLock = new TrackingClusterLock((Serializable) key, (ClusteredCache<Serializable, ?>) cache);
+        } else {
+            // TODO: Update CacheFactoryStrategy so the signature is getLock(final Serializable key, Cache<Serializable, Serializable> cache)
+            clusterLock = new ClusterLock((Serializable) key, (ClusteredCache<Serializable, ?>) cache);
+        }
+
         return clusterLock;
     }
 
@@ -586,8 +605,8 @@ public class ClusteredCacheFactory implements CacheFactoryStrategy {
 
     private static class ClusterLock implements Lock {
 
-        private final Serializable key;
-        private final ClusteredCache<Serializable, ?> cache;
+        protected final Serializable key;
+        protected final ClusteredCache<Serializable, ?> cache;
 
         ClusterLock(final Serializable key, final ClusteredCache<Serializable, ?> cache) {
             this.key = key;
@@ -617,6 +636,54 @@ public class ClusteredCacheFactory implements CacheFactoryStrategy {
         @Override
         public void unlock() {
             cache.unlock(key);
+        }
+
+        @Override
+        public Condition newCondition() {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    private static class TrackingClusterLock extends ClusterLock {
+
+        TrackingClusterLock(final Serializable key, final ClusteredCache<Serializable, ?> cache) {
+            super(key, cache);
+        }
+
+        @Override
+        public void lock() {
+            cacheLockTracker.registerLockRequested(cache.getName(), key);
+            cache.lock(key, -1);
+            cacheLockTracker.registerLockAcquired(cache.getName(), key, true);
+        }
+
+        @Override
+        public void lockInterruptibly() {
+            cacheLockTracker.registerLockRequested(cache.getName(), key);
+            cache.lock(key, -1);
+            cacheLockTracker.registerLockAcquired(cache.getName(), key, true);
+        }
+
+        @Override
+        public boolean tryLock() {
+            cacheLockTracker.registerLockRequested(cache.getName(), key);
+            final boolean lockResult = cache.lock(key, 0);
+            cacheLockTracker.registerLockAcquired(cache.getName(), key, lockResult);
+            return lockResult;
+        }
+
+        @Override
+        public boolean tryLock(final long time, final TimeUnit unit) {
+            cacheLockTracker.registerLockRequested(cache.getName(), key);
+            final boolean lockResult = cache.lock(key, unit.toMillis(time));
+            cacheLockTracker.registerLockAcquired(cache.getName(), key, true);
+            return lockResult;
+        }
+
+        @Override
+        public void unlock() {
+            cache.unlock(key);
+            cacheLockTracker.registerLockReleased(cache.getName(), key);
         }
 
         @Override
